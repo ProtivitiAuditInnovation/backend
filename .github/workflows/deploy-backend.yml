@@ -1,35 +1,90 @@
-name: Deploy Backend
+name: Deploy backend to Azure (be-adm-uar)
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  AZURE_WEBAPP_NAME: be-adm-uar
+  PYTHON_VERSION: "3.12"     # match the backend App Service: Configuration -> General settings -> Stack
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
+      - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Stop if secrets or client data are in the repo
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)runs/|\.PublishSettings$'; then
+            echo "These files must not be in GitHub (.env / runs / publish profiles). Remove them and add them to .gitignore."
+            exit 1
+          fi
+          if grep -rnE --exclude-dir=.git 'AZURE_OPENAI_API_KEY=[^<[:space:]]{20,}' .; then
+            echo "An Azure OpenAI key is committed. Remove it, regenerate the key, and keep it in App Settings only."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '24'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install dependencies
-        run: npm install
-
-      - name: Verify application
         run: |
-          test -f package.json
-          node --check server.js
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Deploy Backend to Azure
+      - name: Check the app starts (same command Azure uses)
+        run: |
+          python -m py_compile app.py chat.py uar_engine.py gunicorn.conf.py
+          gunicorn --bind=127.0.0.1:8000 --timeout 600 app:app &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8000/api/health | grep -q '"ok":true'; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/api/health
+          kill $SERVER_PID
+          rm -rf runs
+
+      - name: Package
+        run: |
+          zip -r "$RUNNER_TEMP/backend.zip" . \
+            -x ".git/*" ".github/*" "runs/*" ".venv/*" "venv/*" "antenv/*" "*__pycache__*" "*.pyc" \
+               ".env" "*.PublishSettings" ".uar_ai_cache.json"
+
+      - name: Deploy to Azure App Service
+        id: deploy
         uses: azure/webapps-deploy@v3
         with:
-          app-name: be-adm-uar
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_BACKEND_PUBLISH_PROFILE }}
-          package: .
+          package: ${{ runner.temp }}/backend.zip
+
+      - name: Check the deployed API
+        env:
+          SITE: ${{ steps.deploy.outputs.webapp-url }}
+        run: |
+          # Azure installs the packages and restarts the app first: allow up to 15 minutes
+          for i in $(seq 1 90); do
+            BODY=$(curl -fsS "$SITE/api/health" || true)
+            if echo "$BODY" | grep -q '"ok":true'; then
+              echo "Backend is up at $SITE"
+              echo "$BODY" | python -c "import json,sys; h=json.load(sys.stdin); print('Azure OpenAI:', 'on (' + str(h['ai']['deployment']) + ')' if h['ai']['enabled'] else 'OFF - check the AZURE_OPENAI_* App Settings')"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "The API did not answer on $SITE/api/health. Check Log stream in the Azure portal."
+          exit 1
