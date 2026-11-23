@@ -1,5 +1,7 @@
 fastapi>=0.110
 uvicorn>=0.29
+uvicorn-worker>=0.2
+gunicorn>=22.0
 python-multipart>=0.0.9
 pandas>=2.0
 openpyxl>=3.1

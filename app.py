@@ -1,7 +1,9 @@
 """UAR Testing API - FastAPI backend (runs separately from the frontend).
 
-Start:  uvicorn app:app --host 0.0.0.0 --port 8000
-Config: backend/.env (Azure OpenAI + UAR_* settings) - see .env.example
+Local:  python -m uvicorn app:app --port 8000
+Azure:  gunicorn --bind=0.0.0.0 --timeout 600 app:app   (gunicorn.conf.py selects the ASGI worker)
+Config: backend/.env or Azure App Settings (Azure OpenAI + UAR_* settings) - see .env.example.
+        App Settings win over .env.
 """
 import json
 import os
@@ -26,13 +28,30 @@ import uar_engine as E
 from chat import RunDB, answer_question
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-E.load_env([os.path.join(BASE, ".env")])
+ON_AZURE = bool(os.environ.get("WEBSITE_SITE_NAME"))          # set by Azure App Service
+# .env next to this file; on Azure also the deployed copy in wwwroot (the build may run the app from /tmp)
+E.load_env([os.path.join(BASE, ".env"),
+            os.path.join(os.environ.get("HOME", ""), "site", "wwwroot", ".env") if ON_AZURE else None])
+E.configure_from_env()
 
-RUNS_DIR = os.environ.get("UAR_RUNS_DIR") or os.path.join(BASE, "runs")
-ORIGINS = [o.strip() for o in os.environ.get(
+
+def _int_env(name, default):
+    raw = str(os.environ.get(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        raise RuntimeError(f"{name} must be a whole number (got '{raw}')")
+
+
+# Azure: keep runs on the persistent /home share (the app folder is replaced on every deployment)
+_DEFAULT_RUNS = (os.path.join(os.environ.get("HOME", BASE), "data", "uar-runs") if ON_AZURE
+                 else os.path.join(BASE, "runs"))
+RUNS_DIR = os.environ.get("UAR_RUNS_DIR") or _DEFAULT_RUNS
+ORIGINS = [o.strip().rstrip("/") for o in os.environ.get(
     "UAR_ALLOWED_ORIGINS", "http://localhost:5500,http://127.0.0.1:5500").split(",") if o.strip()]
-MAX_MB = int(os.environ.get("UAR_MAX_UPLOAD_MB", "300"))
-RETENTION_DAYS = int(os.environ.get("UAR_RETENTION_DAYS", "30"))
+MAX_MB = _int_env("UAR_MAX_UPLOAD_MB", 300)
+RETENTION_DAYS = _int_env("UAR_RETENTION_DAYS", 30)
+STALE_MINUTES = _int_env("UAR_STALE_RUN_MINUTES", 30)      # a run with no progress for this long has stopped
 os.makedirs(RUNS_DIR, exist_ok=True)
 
 # upload slot (form field) -> engine key, allowed extensions, required, label
@@ -154,6 +173,24 @@ def table_payload(df):
     return {"columns": [str(c) for c in df.columns], "rows": [[js(v) for v in row] for row in df.values.tolist()]}
 
 
+def mark_if_stalled(d, meta):
+    """A run whose log has not moved for UAR_STALE_RUN_MINUTES was stopped (e.g. the App Service restarted or was
+    redeployed while it ran). Mark it failed so the page stops waiting."""
+    if meta.get("status") not in ("queued", "running"):
+        return meta
+    try:
+        idle = datetime.now().timestamp() - os.path.getmtime(os.path.join(d, "log.txt"))
+    except OSError:
+        return meta
+    if idle > STALE_MINUTES * 60:
+        msg = (f"The run stopped making progress {int(idle // 60)} minutes ago (the server was probably restarted "
+               f"or redeployed). Start the run again.")
+        append_log(d, f"ERROR: {msg}")
+        update_meta(d, status="failed", error=msg, finished=datetime.now().isoformat(timespec="seconds"))
+        meta = read_meta(d)
+    return meta
+
+
 def load_results(run_id):
     if run_id not in _results_cache:
         p = os.path.join(run_dir(run_id), "results.pkl")
@@ -213,7 +250,13 @@ def process(run_id):
 # ----------------------------------------------------------------------------- API
 @app.get("/api/health")
 def health():
-    return {"ok": True, "ai": ai_status(), "max_upload_mb": MAX_MB, "retention_days": RETENTION_DAYS,
+    c = E.CONFIG
+    defaults = {"app_name": c["app_name"], "control_owner": c["control_owner"], "response_days": c["response_days"],
+                "dormant_days": c["dormant_days"], "elevated_codes": ", ".join(c["elevated_codes"]),
+                "status_approve": c["status_approve"], "status_remove": c["status_remove"],
+                "read_scanned_pdf": bool(c["read_scanned_pdf"])}
+    return {"ok": True, "ai": ai_status(), "defaults": defaults, "max_upload_mb": MAX_MB,
+            "retention_days": RETENTION_DAYS,
             "slots": {k: {"label": v[3], "required": v[2], "extensions": sorted(v[1])} for k, v in SLOTS.items()},
             "approvals_extensions": sorted(EMAIL_EXT | {".zip"})}
 
@@ -250,6 +293,7 @@ def _clean_options(raw):
     if codes:
         out["elevated_codes"] = [str(c)[:20] for c in codes][:50]
     out["use_ai"] = bool(o.get("use_ai", True))
+    out["read_scanned_pdf"] = bool(o.get("read_scanned_pdf", E.CONFIG["read_scanned_pdf"]))
     return out
 
 
@@ -319,7 +363,7 @@ def list_runs(limit: int = 20):
     for name in sorted(os.listdir(RUNS_DIR), reverse=True):
         d = os.path.join(RUNS_DIR, name)
         if RUN_ID.match(name) and os.path.isfile(os.path.join(d, "meta.json")):
-            m = read_meta(d)
+            m = mark_if_stalled(d, read_meta(d))
             rows.append({k: m.get(k) for k in ("run_id", "created", "status", "app_name", "conclusion")})
         if len(rows) >= limit:
             break
@@ -329,7 +373,7 @@ def list_runs(limit: int = 20):
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str):
     d = run_dir(run_id)
-    meta = read_meta(d)
+    meta = mark_if_stalled(d, read_meta(d))
     with open(os.path.join(d, "log.txt"), encoding="utf-8") as fh:
         log = [l.rstrip("\n") for l in fh.readlines()][-400:]
     payload = {k: meta.get(k) for k in ("run_id", "status", "created", "started", "finished", "error", "app_name",

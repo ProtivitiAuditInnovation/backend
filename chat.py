@@ -8,6 +8,7 @@ Read-only is enforced three ways: SELECT/WITH-only text check, a single statemen
 authorizer that denies every operation except reading.
 """
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -33,6 +34,8 @@ TABLE_DOC = {
     "movement": "Access rows removed or added between the start listing and the post-review listing.",
     "ipe": "Report extraction (IPE) checks: row counts, PDF timestamps, dates used.",
     "request_rows": "Every access row pasted in the request e-mails, with the manager it was sent to and the sent date.",
+    "pdf_rows": "Every row read from the system PDF reports (start and post-review listing), page by page, with whether "
+                "it matched the Excel listing row by row; also Excel rows that were not found in the PDF.",
     "emails": "Every distinct e-mail message read (newest, quoted and oldest in each trail), its classification, the "
               "manager it was matched to and how it was read.",
     "summary": "Headline test metrics: section, metric, value.",
@@ -62,6 +65,11 @@ Rules:
 - When listing users, include user code and user name; list at most 25 rows and say how many there are in total.
 - Keep answers short and in plain English, written for an auditor. Use simple bullet lists when listing items.
 """
+
+def _env_int(name, default):
+    raw = str(os.environ.get(name) or "").strip()
+    return int(raw) if raw.isdigit() else default
+
 
 ALLOWED_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
 if hasattr(sqlite3, "SQLITE_RECURSIVE"):
@@ -165,8 +173,11 @@ def _fmt_date(v):
         return str(v)
 
 
-def answer_question(ai, db, results, question, history=None, max_steps=5):
-    """Returns {"answer": str, "steps": [{"sql", "columns", "rows", "row_count", "error"}]}."""
+def answer_question(ai, db, results, question, history=None, max_steps=None):
+    """Returns {"answer": str, "steps": [{"sql", "columns", "rows", "row_count", "error"}]}.
+    UAR_CHAT_MAX_QUERIES (default 5) and UAR_CHAT_HISTORY_MESSAGES (default 6) can be set in .env."""
+    max_steps = max_steps or max(1, _env_int("UAR_CHAT_MAX_QUERIES", 5))
+    n_hist = _env_int("UAR_CHAT_HISTORY_MESSAGES", 6)
     meta = results["meta"]
     summary_txt = "\n".join(f"- {s['metric']}: {s['value']}" for s in results["summary"])
     system = SYSTEM.format(app=meta.get("app_name", ""), start=_fmt_date(meta.get("start_date")),
@@ -174,7 +185,7 @@ def answer_question(ai, db, results, question, history=None, max_steps=5):
                            approve=meta.get("status_approve", ""), remove=meta.get("status_remove", ""),
                            schema=db.schema_text(), summary=summary_txt)
     msgs = [{"role": "system", "content": system}]
-    for h in (history or [])[-6:]:
+    for h in (history or [])[-n_hist:] if n_hist else []:
         if h.get("role") in ("user", "assistant") and h.get("content"):
             msgs.append({"role": h["role"], "content": str(h["content"])[:2000]})
     msgs.append({"role": "user", "content": question})

@@ -1,12 +1,8 @@
-
 .env
-venv/
+runs/
 .venv/
+venv/
 __pycache__/
 *.pyc
-
-runs/
-*.pkl
-*.msg
-*.xlsx
-*.pdf
+*.PublishSettings
+.uar_ai_cache.json

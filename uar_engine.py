@@ -38,6 +38,8 @@ Answers are cached in <input>\\.uar_ai_cache.json so re-runs give identical resu
 Requirements:  pip install pandas openpyxl pdfplumber extract-msg
 """
 import argparse
+import base64
+import difflib
 import glob
 import hashlib
 import html
@@ -46,6 +48,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from html.parser import HTMLParser
@@ -61,7 +64,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.properties import CalcProperties
 
 # =============================================================================
-# CONFIG - edit here if file names / labels change between review periods
+# CONFIG - built-in defaults. Every value below can be set in .env / App Settings (UAR_* variables, see
+# configure_from_env and .env.example); a value entered in the web form overrides it for that run.
 # =============================================================================
 CONFIG = {
     # glob patterns, searched in the input folder ([0-9] keeps "After Listing" out)
@@ -89,7 +93,61 @@ CONFIG = {
         "i need you to review the list of your direct reports",
     ],
     "output": "LA-CP4 TRAX UAR Testing Result.xlsx",
+    # scanned (image-only) PDFs read with Azure OpenAI vision
+    "read_scanned_pdf": True,
+    "pdf_dpi": 150,
+    "pdf_retry_dpi": 220,
+    "pdf_workers": 4,
+    # Azure OpenAI calls
+    "ai_timeout": 180,
+    "ai_retries": 5,
 }
+
+# .env / App Settings name -> (CONFIG key, type)
+ENV_SETTINGS = {
+    "UAR_APP_NAME": ("app_name", str),
+    "UAR_CONTROL_OWNER": ("control_owner", str),
+    "UAR_RESPONSE_DAYS": ("response_days", int),
+    "UAR_DORMANT_DAYS": ("dormant_days", int),
+    "UAR_ELEVATED_CODES": ("elevated_codes", list),
+    "UAR_STATUS_APPROVE": ("status_approve", str),
+    "UAR_STATUS_REMOVE": ("status_remove", str),
+    "UAR_REQUEST_MARKERS": ("request_markers", "markers"),
+    "UAR_REMOVED_SHEET": ("removed_sheet", str),
+    "UAR_READ_SCANNED_PDF": ("read_scanned_pdf", bool),
+    "UAR_PDF_DPI": ("pdf_dpi", int),
+    "UAR_PDF_RETRY_DPI": ("pdf_retry_dpi", int),
+    "UAR_PDF_WORKERS": ("pdf_workers", int),
+    "UAR_AI_TIMEOUT_SECONDS": ("ai_timeout", int),
+    "UAR_AI_RETRIES": ("ai_retries", int),
+}
+
+
+def configure_from_env():
+    """Apply UAR_* settings from the environment (.env or Azure App Settings) to CONFIG.
+    Unset or blank settings keep the built-in defaults above. Returns the names that were applied."""
+    applied = []
+    for name, (key, kind) in ENV_SETTINGS.items():
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        raw = str(raw).strip()
+        try:
+            if kind is int:
+                val = int(raw)
+            elif kind is bool:
+                val = raw.lower() in ("1", "true", "yes", "on")
+            elif kind is list:
+                val = [c.strip().upper() for c in re.split(r"[,;\s]+", raw) if c.strip()]
+            elif kind == "markers":
+                val = [m.strip().lower() for m in raw.split("|") if m.strip()]
+            else:
+                val = raw
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number (got '{raw}')")
+        CONFIG[key] = val
+        applied.append(name)
+    return applied
 
 # keyword fallback (used when Azure OpenAI is off or a call fails); matched at word starts, accents ignored
 REMOVE_KW = ["disable", "remove", "revoke", "terminate", "delete", "deactivate", "offboard",
@@ -589,8 +647,10 @@ def due_from_subjects(subjects, year):
     return None
 
 
-def pdf_check(path):
-    res = {"pages": None, "created": "", "rows": None, "users": None, "note": ""}
+def pdf_check(path, ai=None, xl=None, label="", vision=True):
+    """Row count and 'Created on' from a report PDF. Text PDFs are read directly; image-only (scanned) PDFs are
+    read with Azure OpenAI vision and matched row by row to the Excel listing `xl` when `ai` is available."""
+    res = {"pages": None, "created": "", "rows": None, "users": None, "note": "", "method": "PDF text"}
     if not path:
         res["note"] = "PDF not found"
         return res
@@ -622,8 +682,11 @@ def pdf_check(path):
         codes = re.findall(r"\b[A-Za-z]\d{6}\b", text)
         if len(text.strip()) < 20 * max(res["pages"] or 1, 1):
             res["rows"] = res["users"] = None
-            res["note"] = ("PDF has no text layer (scanned or printed as an image): row count and timestamp "
-                           "must be checked manually or with OCR")
+            res["method"] = "not read (scanned PDF)"
+            if ai is not None and ai.enabled and vision and xl is not None and len(xl):
+                return pdf_vision_check(path, ai, xl, label, res)
+            res["note"] = ("PDF has no text layer (scanned or printed as an image): turn on Azure OpenAI to read it, "
+                           "or check the row count manually")
         elif not codes:
             res["rows"] = res["users"] = None
             res["note"] = "no user codes found in the PDF text - verify manually"
@@ -631,6 +694,199 @@ def pdf_check(path):
             res["rows"], res["users"] = len(codes), len({c.upper() for c in codes})
     except Exception as e:
         res["note"] = f"error reading PDF: {e}"
+    return res
+
+
+# =============================================================================
+# Scanned (image-only) PDFs: read with Azure OpenAI vision, matched row by row to the Excel listing
+# =============================================================================
+PDF_VISION_SYSTEM = ("You transcribe scanned pages of a system user-access report for an IT auditor. Copy exactly "
+                     "what is printed; never guess, complete or invent values. Reply with a single JSON object only.")
+
+PDF_VISION_PROMPT = """This is page {page} of {pages} of a scanned system report listing user access ({app}).
+Transcribe EVERY data row of the table on this page, in the order printed.
+- Do not include the column header row, the report title, or footer lines such as "Created on: ..." or copyright text.
+- A row whose cells wrap onto two lines is still one row.
+- Copy values exactly as printed; use an empty string for anything you cannot read.{code_hint}
+
+Return JSON:
+{{"rows": [{{"user_code": "", "user_name": "", "type_of_membership": "", "name": "", "code": ""}}],
+  "created_on": "the text after 'Created on:' if it appears on this page, else an empty string"}}"""
+
+_DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
+
+
+def _pdf_key(user_code, typ, code):
+    clean = lambda v: re.sub(r"\s+", " ", str(v or "").translate(_DASHES)).strip().upper()
+    return (clean(user_code).replace(" ", ""), clean(typ), clean(code).replace(" ", ""))
+
+
+def _page_jpeg_b64(page, dpi, angle):
+    im = page.to_image(resolution=dpi).original.convert("L")
+    if angle:
+        im = im.rotate(angle, expand=True)
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _code_hint(codes):
+    """Tell the reader the user-code FORMAT (never the expected values), e.g. letter + six digits."""
+    codes = [c for c in codes if c]
+    if codes and sum(bool(re.fullmatch(r"[A-Za-z]\d{6}", c)) for c in codes) >= 0.9 * len(codes):
+        return ("\n- User codes in this report are one letter followed by six digits; read the first character "
+                "as a letter (I, not 1 or l).")
+    return ""
+
+
+def _vision_read(ai, b64, page_no, pages, hint=""):
+    msgs = [{"role": "system", "content": PDF_VISION_SYSTEM},
+            {"role": "user", "content": [
+                {"type": "text", "text": PDF_VISION_PROMPT.format(page=page_no, pages=pages, app=CONFIG["app_name"],
+                                                                  code_hint=hint)},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}]}]
+    out = ai.chat(None, None, messages=msgs)
+    if not isinstance(out, dict):
+        return None
+    rows = [{k: sval(r.get(k, "")) for k in ("user_code", "user_name", "type_of_membership", "name", "code")}
+            for r in (out.get("rows") or []) if isinstance(r, dict)]
+    return {"rows": [r for r in rows if r["user_code"] or r["code"]], "created_on": sval(out.get("created_on", ""))}
+
+
+_LOOKALIKE = [set("I1L|!"), set("O0QD"), set("S5"), set("B8"), set("Z2"), set("GC6"), set("UV")]
+
+
+def _ocr_equal(a, b, min_len=4):
+    """Same value apart from typical reading errors: look-alike characters (I/1, O/0, C/G, S/5, B/8) or stray
+    trailing punctuation. Values shorter than min_len must match exactly, so SA vs UA is a real difference."""
+    a, b = a.rstrip(".,;:'\"`"), b.rstrip(".,;:'\"`")
+    if a == b:
+        return True
+    if len(a) != len(b) or len(a) < min_len:
+        return False
+    diffs = [(x, y) for x, y in zip(a, b) if x != y]
+    return len(diffs) <= 2 and all(any(x in g and y in g for g in _LOOKALIKE) for x, y in diffs)
+
+
+def _align(xl_keys, pdf_keys):
+    """Match PDF rows to Excel rows in report order. Returns (status per PDF row, matched Excel index per PDF row,
+    Excel indexes not found in the PDF). Both come from the same report, so order is a strong signal."""
+    sm = difflib.SequenceMatcher(None, xl_keys, pdf_keys, autojunk=False)
+    status, match, missing = [""] * len(pdf_keys), [None] * len(pdf_keys), []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for k in range(i2 - i1):
+                status[j1 + k], match[j1 + k] = "Matched", i1 + k
+            continue
+        xs, ps = list(range(i1, i2)), list(range(j1, j2))
+        for xi, pj in list(zip(xs, ps)):
+            a, b = xl_keys[xi], pdf_keys[pj]
+            if (a[1] == b[1] or (min(len(a[1]), len(b[1])) >= 6 and _edit1(a[1], b[1]))) \
+                    and _ocr_equal(a[0], b[0]) and _ocr_equal(a[2], b[2]):
+                status[pj], match[pj] = "Matched - small reading difference", xi
+                xs.remove(xi)
+                ps.remove(pj)
+        missing += xs
+        for pj in ps:
+            status[pj] = "PDF row not in Excel"
+    return status, match, sorted(missing)
+
+
+def pdf_vision_check(path, ai, xl, label, res, dpi=None, retry_dpi=None, workers=None):
+    """Fill `res` (the pdf_check result) by reading an image-only PDF with Azure OpenAI vision."""
+    import pdfplumber
+    dpi = dpi or CONFIG["pdf_dpi"]
+    retry_dpi = retry_dpi or CONFIG["pdf_retry_dpi"]
+    workers = workers or CONFIG["pdf_workers"]
+    from concurrent.futures import ThreadPoolExecutor
+    xl_keys = [_pdf_key(u, t, c) for u, t, c in zip(xl["User code"], xl["Type of membership"], xl["Code"])]
+    xl_codes = {k[0] for k in xl_keys}
+    hint = _code_hint(list(xl["User code"]))
+    with pdfplumber.open(path) as pdf:
+        n = len(pdf.pages)
+        res["pages"] = n
+        log(f"  {label} PDF has no text layer - reading {n} scanned pages with Azure OpenAI vision ...")
+        # which way up? keep the rotation whose user codes exist in the Excel listing
+        best, best_score, first = 0, -1, None
+        for angle in (0, 90, 270, 180):
+            r = _vision_read(ai, _page_jpeg_b64(pdf.pages[0], dpi, angle), 1, n, hint)
+            score = sum(1 for row in (r or {}).get("rows", [])
+                        if (c := _pdf_key(row["user_code"], "", "")[0]) in xl_codes
+                        or any(_edit1(c, x) for x in xl_codes if len(x) == len(c)))
+            if score > best_score:
+                best, best_score, first = angle, score, r
+            if r and score >= max(3, len(r["rows"]) // 2):
+                break
+        if best_score <= 0:
+            res["note"] = "Scanned PDF could not be read by Azure OpenAI vision - verify the row count manually"
+            return res
+        pages = {1: first}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {}
+            for i in range(1, n):
+                futs[i + 1] = ex.submit(_vision_read, ai, _page_jpeg_b64(pdf.pages[i], dpi, best), i + 1, n, hint)
+            for k, (pno, fu) in enumerate(sorted(futs.items())):
+                pages[pno] = fu.result()
+                if (k + 2) % 20 == 0 or pno == n:
+                    log(f"    {label} PDF: {pno}/{n} pages read")
+
+        def flatten():
+            rows = [(p, i + 1, r) for p in sorted(pages) for i, r in enumerate((pages[p] or {}).get("rows", []))]
+            return rows, [_pdf_key(r["user_code"], r["type_of_membership"], r["code"]) for _, _, r in rows]
+
+        rows, pdf_keys = flatten()
+        status, match, missing = _align(xl_keys, pdf_keys)
+        # re-read, at higher resolution, any page that failed or holds a mismatch (a misread is more likely than
+        # a real difference, so a difference is only reported after a second look)
+        bad = {p for p in pages if pages[p] is None}
+        bad |= {rows[j][0] for j, s_ in enumerate(status) if s_ == "PDF row not in Excel"}
+        for xi in missing:
+            prev = [j for j, m in enumerate(match) if m is not None and m < xi]
+            nxt = [j for j, m in enumerate(match) if m is not None and m > xi]
+            bad |= {rows[prev[-1]][0]} if prev else set()
+            bad |= {rows[nxt[0]][0]} if nxt else set()
+        if bad:
+            log(f"    {label} PDF: re-reading {len(bad)} page(s) at higher resolution to confirm differences")
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {p: ex.submit(_vision_read, ai, _page_jpeg_b64(pdf.pages[p - 1], retry_dpi, best), p, n, hint)
+                        for p in sorted(bad)}
+                for p, fu in futs.items():
+                    r = fu.result()
+                    if r is not None:
+                        pages[p] = r
+            rows, pdf_keys = flatten()
+            status, match, missing = _align(xl_keys, pdf_keys)
+
+    created = next((pages[p]["created_on"] for p in sorted(pages) if pages[p] and pages[p]["created_on"]), "")
+    m = re.search(r"([A-Z][a-z]{2,8}\s+\d{1,2},\s*\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)", created)
+    res.update({
+        "created": re.sub(r"\s+", " ", m.group(1)) if m else (created or "not found"),
+        "rows": len(rows), "users": len({k[0] for k in pdf_keys}), "method": "Azure OpenAI vision (scanned PDF)",
+        "matched": sum(1 for s_ in status if s_.startswith("Matched")),
+        "fuzzy": sum(1 for s_ in status if s_ == "Matched - small reading difference"),
+        "pdf_extra": sum(1 for s_ in status if s_ == "PDF row not in Excel"), "xl_missing": len(missing),
+        "unreadable_pages": sorted(p for p in pages if pages[p] is None),
+        "note": (f"Read with Azure OpenAI vision (rotation {best} degrees)"
+                 + (f"; {len(bad)} page(s) re-read at {retry_dpi} dpi" if bad else "")),
+    })
+    det = []
+    for (p, i, r), s_, mi in zip(rows, status, match):
+        det.append({"Listing": label, "Page": p, "Row on Page": i, "User code (PDF)": r["user_code"],
+                    "User name (PDF)": r["user_name"], "Type (PDF)": r["type_of_membership"], "Code (PDF)": r["code"],
+                    "Status": s_, "Excel row": (mi + 1) if mi is not None else None})
+    page_of = {}
+    for (p, _, _), mi in zip(rows, match):
+        if mi is not None:
+            page_of[mi] = p
+    for xi in missing:
+        near = [page_of[k] for k in page_of if k < xi]
+        det.append({"Listing": label, "Page": near[-1] if near else 1, "Row on Page": None,
+                    "User code (PDF)": "", "User name (PDF)": "", "Type (PDF)": "", "Code (PDF)": "",
+                    "Status": f"In Excel, not found in PDF: {' | '.join(xl_keys[xi])}", "Excel row": xi + 1})
+    res["detail"] = det
+    log(f"    {label} PDF: {res['rows']} rows read; {res['matched']} matched to the Excel "
+        f"({res['fuzzy']} with small reading differences); {res['xl_missing']} Excel rows not found; "
+        f"{res['pdf_extra']} PDF rows not in the Excel")
     return res
 
 
@@ -666,6 +922,7 @@ class AzureAI:
                 warn("AI cache unreadable - starting a new one")
         self.json_mode = True
         self.calls = self.hits = self.errors = 0
+        self._lock = threading.Lock()
 
     def _save(self):
         if self.cache_path:
@@ -685,13 +942,14 @@ class AzureAI:
         """messages (optional) = full message list for multi-turn chat; otherwise system + user."""
         msgs = messages or [{"role": "system", "content": system}, {"role": "user", "content": user}]
         h = hashlib.sha256((self.deployment + json.dumps(msgs, ensure_ascii=False)).encode("utf-8")).hexdigest()
-        if use_cache and h in self.cache:
-            self.hits += 1
-            return self.cache[h]
+        with self._lock:
+            if use_cache and h in self.cache:
+                self.hits += 1
+                return self.cache[h]
         url = (f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions"
                f"?api-version={self.version}")
         body = {"messages": msgs}
-        for attempt in range(5):
+        for attempt in range(max(1, int(CONFIG["ai_retries"]))):
             if self.json_mode:
                 body["response_format"] = {"type": "json_object"}
             else:
@@ -699,16 +957,17 @@ class AzureAI:
             req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
                                          headers={"Content-Type": "application/json", "api-key": self.key})
             try:
-                with urllib.request.urlopen(req, timeout=180) as r:
+                with urllib.request.urlopen(req, timeout=int(CONFIG["ai_timeout"])) as r:
                     data = json.loads(r.read().decode("utf-8"))
                 content = data["choices"][0]["message"].get("content")
                 out = self._parse(content)
                 if not isinstance(out, dict):
                     raise ValueError("model did not return a JSON object")
-                self.calls += 1
-                if use_cache:
-                    self.cache[h] = out
-                    self._save()
+                with self._lock:
+                    self.calls += 1
+                    if use_cache:
+                        self.cache[h] = out
+                        self._save()
                 return out
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "ignore")[:300]
@@ -724,7 +983,8 @@ class AzureAI:
             except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
                 warn(f"Azure OpenAI call failed ({type(e).__name__}: {str(e)[:150]}) - retrying")
                 time.sleep(3 * 2 ** attempt)
-        self.errors += 1
+        with self._lock:
+            self.errors += 1
         return None
 
 
@@ -991,7 +1251,10 @@ def _run(files, output, options):
         rm = rm[rm["UserID"] != ""].reset_index(drop=True)
 
     log("Checking the PDF reports (row count and 'Created on' timestamp) ...")
-    p1, p2 = pdf_check(f_ur_pdf), pdf_check(f_al_pdf)
+    ai = AzureAI(options.get("cache_path") or os.path.join(os.path.dirname(f_rv), ".uar_ai_cache.json")) if use_ai else None
+    vision = bool(options.get("read_scanned_pdf", CONFIG["read_scanned_pdf"]))
+    p1 = pdf_check(f_ur_pdf, ai, ur, "Start listing", vision)
+    p2 = pdf_check(f_al_pdf, ai, al, "Post-review listing", vision)
 
     def pick_date(opt, path, pdfres, label, xl_info):
         if opt:
@@ -1091,7 +1354,6 @@ def _run(files, output, options):
             u = pd.concat([u, req.loc[req["Manager (e-mail)"] == mgr, ["User code", "User name"]]])
         users_of[mgr] = u.assign(_k=u["User code"].str.upper()).drop_duplicates("_k")[["User code", "User name"]].values.tolist()
 
-    ai = AzureAI(options.get("cache_path") or os.path.join(os.path.dirname(f_rv), ".uar_ai_cache.json")) if use_ai else None
     use_ai_now = bool(ai and ai.enabled)
     if use_ai and not use_ai_now:
         warn("Azure OpenAI not configured (.env / environment variables) - using keyword rules")
@@ -1395,11 +1657,18 @@ def _run(files, output, options):
             return "Verify manually - no 'Created on' footer"
         return "Yes" if d.normalize() == expected.normalize() else f"No - report dated {d:%m-%d-%Y}"
 
-    def rc_txt(pdf_rows, xl_rows):
-        return "Verify manually" if not isinstance(pdf_rows, int) else \
-            ("Yes" if pdf_rows == xl_rows else f"No - difference {pdf_rows - xl_rows}")
+    def rc_txt(pres, xl_rows):
+        n = pres.get("rows")
+        if not isinstance(n, int):
+            return "Verify manually"
+        if "xl_missing" in pres:                       # read with vision and matched row by row
+            if n == xl_rows and not pres["xl_missing"] and not pres["pdf_extra"]:
+                return "Yes"
+            return (f"No - PDF {n} rows vs Excel {xl_rows}: {pres['xl_missing']} Excel rows not found in the PDF, "
+                    f"{pres['pdf_extra']} PDF rows not in the Excel (see PDF_Rows)")
+        return "Yes" if n == xl_rows else f"No - difference {n - xl_rows}"
 
-    rowcount = rc_txt(p1["rows"], len(ur))
+    rowcount = rc_txt(p1, len(ur))
     ipe_df = pd.DataFrame([
         {"Check": "Excel file", "Start listing": os.path.basename(f_ur), "Post-review listing": os.path.basename(f_al)},
         {"Check": "Excel data rows", "Start listing": len(ur), "Post-review listing": len(al)},
@@ -1420,7 +1689,16 @@ def _run(files, output, options):
         {"Check": "PDF date = extraction date", "Start listing": ts_ok(p1["created"], extract_dt, extract_src),
          "Post-review listing": ts_ok(p2["created"], after_dt, after_src)},
         {"Check": "PDF rows (user-code occurrences)", "Start listing": p1["rows"], "Post-review listing": p2["rows"]},
-        {"Check": "Row count PDF = Excel", "Start listing": rowcount, "Post-review listing": rc_txt(p2["rows"], len(al))},
+        {"Check": "Row count PDF = Excel", "Start listing": rowcount, "Post-review listing": rc_txt(p2, len(al))},
+        {"Check": "PDF read method", "Start listing": p1.get("method", ""), "Post-review listing": p2.get("method", "")},
+        {"Check": "PDF rows matched to the Excel (row by row)", "Start listing": p1.get("matched", "n/a"),
+         "Post-review listing": p2.get("matched", "n/a")},
+        {"Check": "  of which with small reading differences", "Start listing": p1.get("fuzzy", "n/a"),
+         "Post-review listing": p2.get("fuzzy", "n/a")},
+        {"Check": "Excel rows not found in the PDF", "Start listing": p1.get("xl_missing", "n/a"),
+         "Post-review listing": p2.get("xl_missing", "n/a")},
+        {"Check": "PDF rows not in the Excel", "Start listing": p1.get("pdf_extra", "n/a"),
+         "Post-review listing": p2.get("pdf_extra", "n/a")},
         {"Check": "Extraction steps document", "Start listing": os.path.basename(f_steps) if f_steps else "not supplied",
          "Post-review listing": ""},
         {"Check": "PDF read note", "Start listing": p1["note"], "Post-review listing": p2["note"]},
@@ -1439,6 +1717,8 @@ def _run(files, output, options):
             ("Access rows - start User Report (Excel)", len(ur)),
             ("Unique users - start User Report", int(ur["User code"].nunique())),
             ("Row count agrees to PDF", rowcount),
+            ("Post-review listing row count agrees to PDF", rc_txt(p2, len(al))),
+            ("How the PDFs were read", f"Start: {p1.get('method', '')}; post-review: {p2.get('method', '')}"),
             ("PDF 'Created on' date agrees to extraction date", ts_ok(p1["created"], extract_dt, extract_src)),
             ("Excel report 'Created on' agrees to extraction date", xl_ok(ur_info, extract_dt, extract_src)),
             ("Footer lines ignored in the listings", ur_info.get("footer_rows", 0) + al_info.get("footer_rows", 0)
@@ -1525,8 +1805,11 @@ def _run(files, output, options):
                             columns=["File", "Message", "Author", "To", "Sent", "Subject", "Classification",
                                      "Matched Manager", "Matched Using", "Read By", "Decision", "Summary", "Text"])
 
+    pdf_rows = pd.DataFrame(p1.get("detail", []) + p2.get("detail", []),
+                            columns=["Listing", "Page", "Row on Page", "User code (PDF)", "User name (PDF)", "Type (PDF)",
+                                     "Code (PDF)", "Status", "Excel row"])
     tables = {"uar": uar_df, "email_counts": cnt_df, "managers": mgr_df, "removals": rem_df, "completeness": comp_df,
-              "movement": mov_df, "ipe": ipe_df, "request_rows": req_out, "emails": email_df}
+              "movement": mov_df, "ipe": ipe_df, "request_rows": req_out, "pdf_rows": pdf_rows, "emails": email_df}
     meta = {"app_name": CONFIG["app_name"], "start_date": extract_dt, "start_date_source": extract_src,
             "after_date": after_dt, "after_date_source": after_src, "due_date": due, "due_date_source": due_src,
             "response_days": window, "method": method, "status_approve": A, "status_remove": R,
@@ -1545,7 +1828,7 @@ def _run(files, output, options):
 
 SHEETS = [("UAR_Analysis", "uar"), ("Email_Row_Count", "email_counts"), ("Manager_Responses", "managers"),
           ("Removals_Testing", "removals"), ("Completeness", "completeness"), ("Movement", "movement"),
-          ("IPE_Check", "ipe"), ("Request_Email_Rows", "request_rows"), ("Email_Log", "emails")]
+          ("IPE_Check", "ipe"), ("PDF_Rows", "pdf_rows"), ("Request_Email_Rows", "request_rows"), ("Email_Log", "emails")]
 WIDE = {"Exception Detail": 48, "Comments": 50, "Email cross-check": 42, "Feedback Mail": 34, "Manager Reply Text": 60,
         "Text": 70, "Decision Quote": 45, "Summary": 40, "E-mail vs Review File": 45, "Missing Rows (first 10)": 50,
         "Names Not Matched / Not Verified": 40, "Conditions": 35, "Subject": 40, "Source": 38, "Removal Verified": 40}
@@ -1624,6 +1907,7 @@ def write_workbook(path, tables, summary, meta, src):
         flag = (("Exception", lambda v: v == "Yes") if "Exception" in cols else
                 ("Removal Verified", lambda v: str(v).startswith("EXCEPTION")) if "Removal Verified" in cols else
                 ("Rows Match Start Report", lambda v: v == "No") if "Rows Match Start Report" in cols else
+                ("Status", lambda v: bool(v) and not str(v).startswith("Matched")) if "Excel row" in cols else
                 (None, None))
         if flag[0]:
             j = cols.index(flag[0]) + 1
@@ -1661,4 +1945,5 @@ if __name__ == "__main__":
     inp = os.path.abspath(a.input)
     load_env([os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), os.path.join(inp, ".env"),
               os.path.join(os.getcwd(), ".env")])
+    configure_from_env()
     run(inp, a.due, a.output, use_ai=not a.no_ai, window=a.window)
